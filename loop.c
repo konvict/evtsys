@@ -64,6 +64,7 @@
 #include "syslog.h"
 #include "ver.h"
 #include "winevent.h"
+#include "wsock.h"
 
 /* Main eventlog monitoring loop */
 int MainLoop()
@@ -78,6 +79,11 @@ int MainLoop()
 
     //EventList IgnoredEvents[MAX_IGNORED_EVENTS];
     XPathList * XPathQueries = (XPathList*)calloc(1, sizeof(*XPathQueries));
+
+    /* Create the stop event used by service/console shutdown to wake the
+       loop immediately instead of waiting out a fixed sleep. */
+    if (ServiceStopEvent == NULL)
+        ServiceStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
     /* Check for new Crimson Log Service */
 	winEvents = CheckForWindowsEvents();
@@ -121,7 +127,14 @@ int MainLoop()
     if (winEvents) {
         if(WinEventSubscribe(XPathQueries, XPATH_COUNT) != ERROR_SUCCESS)
         {
-            ServiceIsRunning = FALSE;
+            if (subscriptions > 0) {
+                /* Partial failure: keep collecting from the channels that
+                   subscribed successfully */
+                Log(LOG_WARNING, "Some event subscriptions failed; continuing with %d active subscription(s)", subscriptions);
+            } else {
+                Log(LOG_ERROR, "No event subscriptions could be created");
+                ServiceIsRunning = FALSE;
+            }
         }
     }
 
@@ -134,25 +147,31 @@ int MainLoop()
 				/* Loop for all messages */
                 while ((output = EventlogNext(IgnoredEvents, log, &level))) {
                     if (output != NULL) {
-						if (SyslogSend(output, level)) {
-							ServiceIsRunning = FALSE;
-							break;
-						}
+						/* Delivery failure is counted in WSockSend and must
+						   not stop the service */
+						SyslogSend(output, level);
                     }
                 }
 			}
 		}
-		
+
 		/* Send status message to inform server that client is active */
 		if (SyslogStatusInterval != 0) {
 			if (++stat_counter == SyslogStatusInterval*12) { // Because the service loops ~12 times/min
 				stat_counter = 0; /* Reset Counter */
-				Log(LOG_INFO, "Eventlog to Syslog Service Running");
+				Log(LOG_INFO, "Eventlog to Syslog Service Running (format_failures=%ld, send_failures=%ld)",
+					WinEventFormatFailures,
+					WSockSendFailures);
 			}
         }
 
-		/* Sleep five seconds */
-		Sleep(5000);
+		/* Sleep five seconds, or wake up immediately when a stop is signalled */
+		if (ServiceStopEvent != NULL) {
+			if (WaitForSingleObject(ServiceStopEvent, 5000) == WAIT_OBJECT_0)
+				ServiceIsRunning = FALSE;
+		} else {
+			Sleep(5000);
+		}
 	}
 
 	/* Service is stopped */

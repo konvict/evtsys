@@ -14,100 +14,69 @@
 #pragma comment(lib, "delayimp.lib") /* Prevents winevt from loading unless necessary */
 #pragma comment(lib, "wevtapi.lib")	 /* New Windows Events logging library for Vista and beyond */
 
-WCHAR * pluginLogin(EVT_HANDLE hEvent)
+/* Build the compact login summary into the caller-provided buffer.
+   Returns the buffer, or NULL when the event should be skipped
+   (filtered account or missing fields). */
+LPWSTR pluginLogin(EVT_HANDLE hEvent, LPWSTR message, size_t count)
 {
 	PEVT_VARIANT eventInfo = NULL;
-	eventInfo = GetLoginInfo(hEvent);
-	static WCHAR message[SYSLOG_DEF_SZ];
-	static WCHAR * wsGuid;
-	
+	WCHAR wsGuid[50];
 
+	if (message == NULL || count == 0)
+		return NULL;
+
+	eventInfo = GetLoginInfo(hEvent);
 	if (!eventInfo) {
 		return NULL;
 	}
 
-	if (eventInfo[0].GuidVal == NULL || EndsWith(eventInfo[1].StringVal, L"$") || StartsWith(eventInfo[1].StringVal, L"MSOL_")){
+	/* Skip computer accounts ("...$" suffix) and MSOL_* accounts */
+	if (eventInfo[0].GuidVal == NULL ||
+		eventInfo[1].StringVal == NULL ||
+		eventInfo[2].StringVal == NULL ||
+		eventInfo[3].StringVal == NULL ||
+		EndsWith(eventInfo[1].StringVal, L"$") ||
+		StartsWith(eventInfo[1].StringVal, L"MSOL_")){
 		free(eventInfo);
 		return NULL;
 	}
 	// Print the values from the System section of the element.
-	wsGuid = GuidToString(eventInfo[0].GuidVal);
+	GuidToString(eventInfo[0].GuidVal, wsGuid, COUNT_OF(wsGuid));
 
-	_snwprintf_s(message, COUNT_OF(message), _TRUNCATE, L"%s:%s:%s:%s",
+	_snwprintf_s(message, count, _TRUNCATE, L"%s:%s:%s:%s",
 		wsGuid,
 		 eventInfo[1].StringVal, eventInfo[2].StringVal, eventInfo[3].StringVal
 		);
 
 	free(eventInfo);
-	 //(LPWSTR)eventInfo[0].StringVal;
 
 	return message;
-
 }
 
 
 /* Get specific values from an event */
 PEVT_VARIANT GetLoginInfo(EVT_HANDLE hEvent)
 {
-	EVT_HANDLE hContext = NULL;
-	PEVT_VARIANT pRenderedEvents = NULL;
 	LPWSTR ppValues[] = {
 		L"Event/EventData/Data[@Name='LogonGuid']",
 		L"Event/EventData/Data[@Name='TargetUserName']",
 		L"Event/EventData/Data[@Name='WorkstationName']",
 		L"Event/EventData/Data[@Name='IpAddress']" };
-	DWORD count = COUNT_OF(ppValues);
-	DWORD dwReturned = 0;
-	DWORD dwBufferSize = (256 * sizeof(LPWSTR)*count);
-	DWORD dwValuesCount = 0;
-	DWORD status = 0;
 
-	/* Create the context to use for EvtRender */
-	hContext = EvtCreateRenderContext(count, (LPCWSTR*)ppValues, EvtRenderContextValues);
-	if (NULL == hContext) {
-		Log(LOG_ERROR | LOG_SYS, "EvtCreateRenderContext failed");
-		goto cleanup;
-	}
-
-	pRenderedEvents = (PEVT_VARIANT)malloc(dwBufferSize);
-	/* Use EvtRender to capture the Publisher name from the Event */
-	/* Log Errors to the event log if things go wrong */
-	if (!EvtRender(hContext, hEvent, EvtRenderEventValues, dwBufferSize, pRenderedEvents, &dwReturned, &dwValuesCount)) {
-		if (ERROR_INSUFFICIENT_BUFFER == GetLastError()) {
-			dwBufferSize = dwReturned;
-			realloc(pRenderedEvents, dwBufferSize);
-			if (!EvtRender(hContext, hEvent, EvtRenderEventValues, dwBufferSize, pRenderedEvents, &dwReturned, &dwValuesCount)) {
-				if (LogInteractive)
-					Log(LOG_ERROR | LOG_SYS, "Error Rendering Event");
-				status = ERR_FAIL;
-			}
-		}
-		else {
-			status = ERR_FAIL;
-			if (LogInteractive)
-				Log(LOG_ERROR | LOG_SYS, "Error Rendering Event");
-		}
-	}
-
-cleanup:
-	if (hContext)
-		EvtClose(hContext);
-
-	if (status == ERR_FAIL)
-		return NULL;
-	else
-		return pRenderedEvents;
+	return WinEventRenderValues(hEvent, (LPCWSTR*)ppValues, COUNT_OF(ppValues));
 }
 
-WCHAR * GuidToString(GUID * guid)
+WCHAR * GuidToString(GUID * guid, WCHAR * out, size_t count)
 {
-	static WCHAR wsGuid[50];
+	if (out == NULL || count == 0)
+		return NULL;
+
 	if (guid == NULL){
-		_snwprintf_s(wsGuid, COUNT_OF(wsGuid), _TRUNCATE, L"00000000-0000-0000-0000-000000000000");
-		return wsGuid;
+		_snwprintf_s(out, count, _TRUNCATE, L"00000000-0000-0000-0000-000000000000");
+		return out;
 	}
 
-	_snwprintf_s(wsGuid, COUNT_OF(wsGuid), _TRUNCATE, L"%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+	_snwprintf_s(out, count, _TRUNCATE, L"%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
 		guid->Data1,
 		guid->Data2,
 		guid->Data3,
@@ -121,5 +90,5 @@ WCHAR * GuidToString(GUID * guid)
 		guid->Data4[7]
 		);
 
-	return wsGuid;
+	return out;
 }

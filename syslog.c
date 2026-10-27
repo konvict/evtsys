@@ -86,37 +86,66 @@ DWORD SyslogEnableTcp = FALSE;
 // Open syslog connection //
 int SyslogOpen()
 {
+	int opened = 0;
+	int failed = 0;
+
 	// Query the dhcp if enabled //
-	if(SyslogQueryDhcp && !DHCPQuery())
-		WSockOpen(SyslogLogHostDhcp, (unsigned short)SyslogPort, LOG_HOST_DHCP);
+	if(SyslogQueryDhcp && !DHCPQuery()) {
+		if (WSockOpen(SyslogLogHostDhcp, (unsigned short)SyslogPort, LOG_HOST_DHCP) == 0)
+			opened++;
+		else
+			failed++;
+	}
 
-	// Start network connections //
-	if (SyslogLogHost1[0] != '\0')
-		if (WSockOpen(SyslogLogHost1, (unsigned short)SyslogPort, LOG_HOST1))
-			return 1;
+	// Start network connections: one bad host must not block the others //
+	if (SyslogLogHost1[0] != '\0') {
+		if (WSockOpen(SyslogLogHost1, (unsigned short)SyslogPort, LOG_HOST1) == 0)
+			opened++;
+		else
+			failed++;
+	}
 
-	if (SyslogLogHost2[0] != '\0')
-		if (WSockOpen(SyslogLogHost2, (unsigned short)SyslogPort, LOG_HOST2))
-			return 1;
+	if (SyslogLogHost2[0] != '\0') {
+		if (WSockOpen(SyslogLogHost2, (unsigned short)SyslogPort, LOG_HOST2) == 0)
+			opened++;
+		else
+			failed++;
+	}
 
-	if (SyslogLogHost3[0] != '\0')
-		if (WSockOpen(SyslogLogHost3, (unsigned short)SyslogPort, LOG_HOST3))
-			return 1;
+	if (SyslogLogHost3[0] != '\0') {
+		if (WSockOpen(SyslogLogHost3, (unsigned short)SyslogPort, LOG_HOST3) == 0)
+			opened++;
+		else
+			failed++;
+	}
 
-	if (SyslogLogHost4[0] != '\0')
-		if (WSockOpen(SyslogLogHost4, (unsigned short)SyslogPort, LOG_HOST4))
-			return 1;
-    
-    if (SyslogLogHost5[0] != '\0')
-		if (WSockOpen(SyslogLogHost5, (unsigned short)SyslogPort, LOG_HOST5))
-			return 1;
+	if (SyslogLogHost4[0] != '\0') {
+		if (WSockOpen(SyslogLogHost4, (unsigned short)SyslogPort, LOG_HOST4) == 0)
+			opened++;
+		else
+			failed++;
+	}
 
-    if (SyslogLogHost6[0] != '\0')
-		if (WSockOpen(SyslogLogHost6, (unsigned short)SyslogPort, LOG_HOST6))
-			return 1;
+    if (SyslogLogHost5[0] != '\0') {
+		if (WSockOpen(SyslogLogHost5, (unsigned short)SyslogPort, LOG_HOST5) == 0)
+			opened++;
+		else
+			failed++;
+	}
 
-    // Success //
-	return 0;
+    if (SyslogLogHost6[0] != '\0') {
+		if (WSockOpen(SyslogLogHost6, (unsigned short)SyslogPort, LOG_HOST6) == 0)
+			opened++;
+		else
+			failed++;
+	}
+
+    // Succeed as long as at least one target socket was opened //
+    // (an unreachable server only marks its slot for reconnection) //
+	if (opened > 0 || failed == 0)
+		return 0;
+
+	return 1;
 }
 
 // Close syslog connection //
@@ -130,7 +159,8 @@ int SyslogSend(char * message, int level)
 {
 	char error_message[SYSLOG_DEF_SZ];
 	WCHAR utf16_message[SYSLOG_DEF_SZ];
-	char utf8_message[SYSLOG_DEF_SZ];
+	/* UTF-8 needs up to 3 bytes per UTF-16 code unit for CJK text */
+	char utf8_message[SYSLOG_DEF_SZ * 3 + 32];
 
 	// Write priority level //
 	_snprintf_s(error_message, sizeof(error_message), _TRUNCATE,
@@ -140,8 +170,17 @@ int SyslogSend(char * message, int level)
 	);
 
 	// convert from ansi/cp850 codepage (local system codepage) to utf8, widely used codepage on unix systems //
-	MultiByteToWideChar(CP_ACP, 0, error_message, -1, utf16_message, SYSLOG_DEF_SZ);
-	WideCharToMultiByte(CP_UTF8, 0, utf16_message, -1, utf8_message, SYSLOG_DEF_SZ, NULL, NULL);
+	if (MultiByteToWideChar(CP_ACP, 0, error_message, -1, utf16_message, SYSLOG_DEF_SZ) == 0) {
+		// Fall back to a plain ASCII notice so the event is not lost silently //
+		_snprintf_s(utf8_message, sizeof(utf8_message), _TRUNCATE,
+			"<%d>evtsys: message conversion failed", level);
+		return WSockSend(utf8_message);
+	}
+
+	if (WideCharToMultiByte(CP_UTF8, 0, utf16_message, -1, utf8_message, (int)sizeof(utf8_message), NULL, NULL) == 0) {
+		_snprintf_s(utf8_message, sizeof(utf8_message), _TRUNCATE,
+			"<%d>evtsys: message conversion failed", level);
+	}
 
 	// Send result to syslog server //
 	return WSockSend(utf8_message);
@@ -151,7 +190,8 @@ int SyslogSend(char * message, int level)
 int SyslogSendW(WCHAR * message, int level)
 {
 	WCHAR utf16_message[SYSLOG_DEF_SZ];
-	char utf8_message[SYSLOG_DEF_SZ];
+	/* UTF-8 needs up to 3 bytes per UTF-16 code unit for CJK text */
+	char utf8_message[SYSLOG_DEF_SZ * 3 + 32];
 
 
 	// Write priority level //
@@ -162,7 +202,11 @@ int SyslogSendW(WCHAR * message, int level)
 	);
 
 	// convert to utf8, widely used codepage on unix systems //
-	WideCharToMultiByte(CP_UTF8, 0, utf16_message, -1, utf8_message, SYSLOG_DEF_SZ, NULL, NULL);
+	if (WideCharToMultiByte(CP_UTF8, 0, utf16_message, -1, utf8_message, (int)sizeof(utf8_message), NULL, NULL) == 0) {
+		// Fall back to a plain ASCII notice so the event is not lost silently //
+		_snprintf_s(utf8_message, sizeof(utf8_message), _TRUNCATE,
+			"<%d>evtsys: message conversion failed", level);
+	}
 
 	// Send result to syslog server //
 	return WSockSend(utf8_message);

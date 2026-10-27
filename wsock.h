@@ -62,3 +62,6 @@
 #define LOG_HOST5		4
 #define LOG_HOST6		5
 #define LOG_HOST_DHCP	6
+
+/* Counter of messages that could not be delivered to any syslog server */
+extern volatile LONG WSockSendFailures;

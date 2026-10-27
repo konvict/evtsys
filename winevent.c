@@ -69,6 +69,9 @@ struct WinEventlog {
 int		   subscriptions = 0;
 EVT_HANDLE WinEventSub[MAX_SUBSCRIPTIONS];
 
+/* Counter of events whose message text could not be formatted */
+volatile LONG WinEventFormatFailures = 0;
+
 /* Subscribe to new events */
 DWORD WinEventSubscribe(XPathList * xpathQueries, int queryCount)
 {
@@ -79,24 +82,35 @@ DWORD WinEventSubscribe(XPathList * xpathQueries, int queryCount)
 	XPathList * iter;
 
     pQueryL = (WCHAR*)malloc(QUERY_LIST_SZ);
-	
+	if (pQueryL == NULL) {
+		Log(LOG_ERROR|LOG_SYS, "Cannot allocate query buffer");
+		return ERR_FAIL;
+	}
+
+	error_msg = (LPWSTR)malloc(SYSLOG_DEF_SZ*sizeof(WCHAR));
+	if (error_msg == NULL) {
+		Log(LOG_ERROR|LOG_SYS, "Cannot allocate error buffer");
+		free(pQueryL);
+		return ERR_FAIL;
+	}
+
 	for (iter = xpathQueries; iter != NULL; iter = iter->next) {
+		EVT_HANDLE subscription;
+
 		if(!CreateQueryString(pQueryL, iter))
 			continue;
 
-		WinEventSub[subscriptions++] = EvtSubscribe(NULL, NULL, NULL, pQueryL, NULL, iter->plugin,
-									 (EVT_SUBSCRIBE_CALLBACK)WinEventCallback,
+		subscription = EvtSubscribe(NULL, NULL, NULL, pQueryL, NULL, iter->plugin,
+									 WinEventCallback,
 									 EvtSubscribeToFutureEvents);
 
-		error_msg = (LPWSTR)malloc(SYSLOG_DEF_SZ*sizeof(WCHAR));
-		
-		if (WinEventSub == NULL)
+		if (subscription == NULL)
 		{
-			status = GetLastError();
+			DWORD error = GetLastError();
 
-			if (ERROR_EVT_CHANNEL_NOT_FOUND == status)
-				Log(LOG_WARNING, "Channel %s was not found.\n", "Unknown");
-			else if (ERROR_EVT_INVALID_QUERY == status)
+			if (ERROR_EVT_CHANNEL_NOT_FOUND == error)
+				Log(LOG_WARNING, "Channel %s was not found.\n", iter->source);
+			else if (ERROR_EVT_INVALID_QUERY == error)
 			{
 				Log(LOG_ERROR, "The query \"%S\" is not valid.\n", pQueryL);
 
@@ -104,16 +118,25 @@ DWORD WinEventSubscribe(XPathList * xpathQueries, int queryCount)
 					Log(LOG_ERROR, "%S", error_msg);
 			}
 			else
-				Log(LOG_ERROR | LOG_SYS, "EvtSubscribe failed with %lu.\n", status);
+				Log(LOG_ERROR | LOG_SYS, "EvtSubscribe failed with %lu.\n", error);
 
-			WinEventCancelSubscribes();
+			/* Keep the subscriptions that succeeded; report the failure */
 			status = ERR_FAIL;
+			continue;
 		}
 
+		if (subscriptions >= MAX_SUBSCRIPTIONS) {
+			Log(LOG_ERROR, "Subscription limit (%d) reached; extra subscription closed", MAX_SUBSCRIPTIONS);
+			EvtClose(subscription);
+			status = ERR_FAIL;
+			break;
+		}
+
+		WinEventSub[subscriptions++] = subscription;
 	}
 
-	if (pQueryL != NULL)
-		free(pQueryL);
+	free(error_msg);
+	free(pQueryL);
     return status;
 }
 
@@ -145,9 +168,13 @@ boolean CreateQueryString(WCHAR * pQueryL, XPathList * xpathQueries)
 /* Cancel the subscription */
 void WinEventCancelSubscribes()
 {
-	while (subscriptions >= 0){
-		EvtClose(WinEventSub[subscriptions--]);
-	}        
+	/* subscriptions is the count of valid handles (indices 0..subscriptions-1) */
+	while (subscriptions > 0){
+		EVT_HANDLE handle = WinEventSub[--subscriptions];
+		WinEventSub[subscriptions] = NULL;
+		if (handle != NULL)
+			EvtClose(handle);
+	}
 }
 
 /* This function is called whenever a matching event is triggered */
@@ -180,63 +207,131 @@ DWORD WINAPI WinEventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID context,
     {
 		Log(LOG_ERROR | LOG_SYS, "Error sending log message");
 
-        WinEventCancelSubscribes();
-        ServiceIsRunning = FALSE;
+		/* Only signal shutdown here: subscription handles are destroyed by
+		   the management thread in MainLoop, never from a callback thread. */
+		ServiceSignalStop();
     }
 
     return status; // The service ignores the returned status.
 }
 
-/* Get specific values from an event */
-PEVT_VARIANT GetEventInfo(EVT_HANDLE hEvent)
+/* Render a set of event property values into a heap-allocated buffer.
+   Handles the grow-and-retry dance of EvtRender safely. Returns NULL on
+   failure; the caller must free() the returned buffer. */
+PEVT_VARIANT WinEventRenderValues(EVT_HANDLE hEvent, LPCWSTR * values, DWORD count)
 {
 	EVT_HANDLE hContext = NULL;
 	PEVT_VARIANT pRenderedEvents = NULL;
-	LPWSTR ppValues[] = {L"Event/System/Provider/@Name",
-						 L"Event/System/TimeCreated/@SystemTime",
-						 L"Event/System/EventID",
-						 L"Event/System/Level",
-						 L"Event/System/Keywords" };
-    DWORD count = COUNT_OF(ppValues);
-    DWORD dwReturned = 0;
+	DWORD dwReturned = 0;
 	DWORD dwBufferSize = (256*sizeof(LPWSTR)*count);
 	DWORD dwValuesCount = 0;
-	DWORD status = 0;
+	BOOL ok = FALSE;
 
 	/* Create the context to use for EvtRender */
-	hContext = EvtCreateRenderContext(count, (LPCWSTR*)ppValues, EvtRenderContextValues);
+	hContext = EvtCreateRenderContext(count, values, EvtRenderContextValues);
 	if (NULL == hContext) {
 		Log(LOG_ERROR|LOG_SYS, "EvtCreateRenderContext failed");
 		goto cleanup;
 	}
 
 	pRenderedEvents = (PEVT_VARIANT)malloc(dwBufferSize);
-	/* Use EvtRender to capture the Publisher name from the Event */
+	if (pRenderedEvents == NULL) {
+		Log(LOG_ERROR|LOG_SYS, "malloc failed for event render buffer");
+		goto cleanup;
+	}
+
+	/* Use EvtRender to capture the values from the Event */
 	/* Log Errors to the event log if things go wrong */
 	if (!EvtRender(hContext, hEvent, EvtRenderEventValues, dwBufferSize, pRenderedEvents, &dwReturned, &dwValuesCount)) {
-		if (ERROR_INSUFFICIENT_BUFFER == GetLastError()) {
-			dwBufferSize = dwReturned;
-			realloc(pRenderedEvents, dwBufferSize);
-			if (!EvtRender(hContext, hEvent, EvtRenderEventValues, dwBufferSize, pRenderedEvents, &dwReturned, &dwValuesCount)) {
-				if (LogInteractive)
-					printf("Error Rendering Event");
-				status = ERR_FAIL;
-			}
-		} else {
-			status = ERR_FAIL;
+		PEVT_VARIANT pNewBuffer;
+
+		if (ERROR_INSUFFICIENT_BUFFER != GetLastError()) {
 			if (LogInteractive)
 				printf("Error Rendering Event");
+			goto cleanup;
+		}
+
+		/* Grow the buffer to the reported size and render again */
+		dwBufferSize = dwReturned;
+		pNewBuffer = (PEVT_VARIANT)realloc(pRenderedEvents, dwBufferSize);
+		if (pNewBuffer == NULL) {
+			Log(LOG_ERROR|LOG_SYS, "realloc failed for event render buffer");
+			goto cleanup;
+		}
+		pRenderedEvents = pNewBuffer;
+
+		if (!EvtRender(hContext, hEvent, EvtRenderEventValues, dwBufferSize, pRenderedEvents, &dwReturned, &dwValuesCount)) {
+			if (LogInteractive)
+				printf("Error Rendering Event");
+			goto cleanup;
 		}
 	}
+
+	if (dwValuesCount != count) {
+		if (LogInteractive)
+			printf("Error Rendering Event");
+		goto cleanup;
+	}
+
+	ok = TRUE;
 
 cleanup:
 	if (hContext)
 		EvtClose(hContext);
 
-	if (status == ERR_FAIL)
+	if (!ok) {
+		if (pRenderedEvents != NULL)
+			free(pRenderedEvents);
+		pRenderedEvents = NULL;
+	}
+
+	return pRenderedEvents;
+}
+
+/* Get specific values from an event */
+PEVT_VARIANT GetEventInfo(EVT_HANDLE hEvent)
+{
+	LPWSTR ppValues[] = {L"Event/System/Provider/@Name",
+						 L"Event/System/TimeCreated/@SystemTime",
+						 L"Event/System/EventID",
+						 L"Event/System/Level",
+						 L"Event/System/Keywords",
+						 L"Event/System/Channel",
+						 L"Event/System/EventRecordID" };
+
+	return WinEventRenderValues(hEvent, (LPCWSTR*)ppValues, COUNT_OF(ppValues));
+}
+
+/* Render the raw event XML. Returns a heap string the caller must free(). */
+static LPWSTR GetEventXmlString(EVT_HANDLE hEvent)
+{
+	LPWSTR pBuffer = NULL;
+	DWORD dwBufferSize = 0;
+	DWORD dwBufferUsed = 0;
+	DWORD dwValuesCount = 0;
+
+	/* First call determines the required size (in bytes) */
+	if (!EvtRender(NULL, hEvent, EvtRenderEventXml, 0, NULL, &dwBufferUsed, &dwValuesCount)) {
+		if (ERROR_INSUFFICIENT_BUFFER != GetLastError())
+			return NULL;
+	}
+
+	if (dwBufferUsed == 0)
 		return NULL;
-	else 
-		return pRenderedEvents;
+
+	dwBufferSize = dwBufferUsed;
+	pBuffer = (LPWSTR)malloc(dwBufferSize);
+	if (pBuffer == NULL) {
+		Log(LOG_ERROR|LOG_SYS, "malloc failed for event XML buffer");
+		return NULL;
+	}
+
+	if (!EvtRender(NULL, hEvent, EvtRenderEventXml, dwBufferSize, pBuffer, &dwBufferUsed, &dwValuesCount)) {
+		free(pBuffer);
+		return NULL;
+	}
+
+	return pBuffer;
 }
 
 /* Gets the specified message string from the event. If the event does not
@@ -300,6 +395,9 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
 
 	WCHAR source[SOURCE_SZ];
 	WCHAR hostname[HOSTNAME_SZ];
+	WCHAR tstamp_buf[32];
+	WCHAR plugin_msg[SYSLOG_DEF_SZ];
+	WCHAR collapsed_msg[SYSLOG_DEF_SZ];
 	WCHAR * formatted_string = NULL;
 	WCHAR * tstamp = NULL;
 	WCHAR * index = NULL;
@@ -314,25 +412,46 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
 	}
 	pwszPublisherName = (LPWSTR)eventInfo[0].StringVal;
 	eventTime = eventInfo[1].FileTimeVal;
-	event_id = eventInfo[2].UInt16Val;
 
-
+	/* Read the EventID through the type the API actually returned */
+	switch (eventInfo[2].Type) {
+	case EvtVarTypeUInt16:
+		event_id = (int)eventInfo[2].UInt16Val;
+		break;
+	case EvtVarTypeUInt32:
+		event_id = (int)eventInfo[2].UInt32Val;
+		break;
+	case EvtVarTypeInt16:
+		event_id = (int)eventInfo[2].Int16Val;
+		break;
+	case EvtVarTypeInt32:
+		event_id = (int)eventInfo[2].Int32Val;
+		break;
+	default:
+		event_id = 0;
+		break;
+	}
 
 	/* Check for the "Microsoft-Windows-" prefix in the publisher name */
 	/* and remove it if found. Saves 18 characters in the message */
-	if(wcsncmp(pwszPublisherName, L"Microsoft-Windows-", 18) == 0)
+	if (pwszPublisherName == NULL)
+		wcsncpy_s(source, COUNT_OF(source), L"UnknownSource", _TRUNCATE);
+	else if(wcsncmp(pwszPublisherName, L"Microsoft-Windows-", 18) == 0)
 		wcsncpy_s(source, COUNT_OF(source), pwszPublisherName+18, _TRUNCATE);
 	else
 		wcsncpy_s(source, COUNT_OF(source), pwszPublisherName, _TRUNCATE);
 
 	/* Check Event Info Against Ignore List */
 	if (WIgnoreSyslogEvent(IgnoredEvents, source, event_id)) {
+		free(eventInfo);
 		return ERR_CONTINUE;
 	}
 
 	/* Format Event Timestamp */
-	if ((tstamp = WinEventTimeToString(eventTime)) == NULL)
+	if (WinEventTimeToString(eventTime, tstamp_buf, COUNT_OF(tstamp_buf)) == NULL)
 		tstamp = L"TIME_ERROR";
+	else
+		tstamp = tstamp_buf;
 
 	/* Add hostname for RFC compliance (RFC 3164) */
 	if (ProgramUseIPAddress == TRUE) {
@@ -397,44 +516,50 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
 
 
 		/* Get the handle to the provider's metadata that contains the message strings. */
-		hProviderMetadata = EvtOpenPublisherMetadata(NULL, pwszPublisherName, NULL, 0, 0);
-		if (NULL == hProviderMetadata) {
-			if (LogInteractive)
-				printf("%i:%S: OpenPublisherMetadata failed for Publisher: \"%S\"", event_id, source, source);
-			return ERR_CONTINUE;
-		}
+		if (pwszPublisherName != NULL)
+			hProviderMetadata = EvtOpenPublisherMetadata(NULL, pwszPublisherName, NULL, 0, 0);
 
 		/* Get the message string from the event */
-		pwsMessage = GetMessageString(hProviderMetadata, hEvent);
-		if (pwsMessage == NULL) {
-			
-			Log(level | LOG_SYS, "%i:%S: Error getting message string for event DETAILS: Publisher: %S EventID: %i", event_id, source, source, event_id);
+		if (hProviderMetadata != NULL)
+			pwsMessage = GetMessageString(hProviderMetadata, hEvent);
 
-			EvtClose(hProviderMetadata);
-			return ERR_CONTINUE;
+		if (pwsMessage == NULL) {
+			/* A missing provider/message DLL does not invalidate the event.
+			   Count the failure and fall back to the raw event XML. */
+			InterlockedIncrement(&WinEventFormatFailures);
+			Log(level | LOG_SYS, "%i:%S: Error getting message string for event DETAILS: Publisher: %S EventID: %i", event_id, source, source, event_id);
+			pwsMessage = GetEventXmlString(hEvent);
 		}
-		
 
 		/* Get string and strip whitespace */
-		formatted_string = CollapseExpandMessageW(pwsMessage);
+		if (pwsMessage != NULL)
+			formatted_string = CollapseExpandMessageW(pwsMessage, collapsed_msg, COUNT_OF(collapsed_msg));
 
 		/* Create a default message if resources or formatting didn't work */
 		if (formatted_string == NULL) {
+			/* Last resort: keep the identifying fields so the event is not lost */
+			LPCWSTR channel = (EvtVarTypeString == eventInfo[5].Type && eventInfo[5].StringVal != NULL) ? eventInfo[5].StringVal : L"?";
+			ULONGLONG record_id = (EvtVarTypeUInt64 == eventInfo[6].Type) ? eventInfo[6].UInt64Val : 0;
+
 			if(SyslogIncludeTag)
 			{
 				_snwprintf_s(defmsg, COUNT_OF(defmsg), _TRUNCATE,
-					L"%S: (Facility: %u, Status: %s)",
+					L"%S: (Channel: %s, Provider: %s, EventID: %i, RecordID: %I64u)",
 					SyslogTag,
-					HRESULT_FACILITY(event_id),
-					FAILED(event_id) ? L"Failure" : L"Success"
+					channel,
+					source,
+					event_id,
+					record_id
 				);
 			}
 			else
 			{
 				_snwprintf_s(defmsg, COUNT_OF(defmsg), _TRUNCATE,
-					L"(Facility: %u, Status: %s)",
-					HRESULT_FACILITY(event_id),
-					FAILED(event_id) ? L"Failure" : L"Success"
+					L"(Channel: %s, Provider: %s, EventID: %i, RecordID: %I64u)",
+					channel,
+					source,
+					event_id,
+					record_id
 				);
 			}
 			formatted_string = defmsg;
@@ -444,20 +569,16 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
 		/*if (LogInteractive){
 			Log(LOG_INFO, "Run login plugin");
 		}*/
-		formatted_string = pluginLogin(hEvent);
+		formatted_string = pluginLogin(hEvent, plugin_msg, COUNT_OF(plugin_msg));
 
 		/*if (LogInteractive) {
 			Log(LOG_INFO, "Plugin returned: %ls", formatted_string);
 		}*/
 		if (formatted_string == NULL){
-			if (eventInfo)
-				free(eventInfo);
+			free(eventInfo);
 
-			if (hProviderMetadata)
-				EvtClose(hProviderMetadata);
-			if (hEvent)
-				EvtClose(hEvent);
-			
+			/* The event handle belongs to the Event Log service (see
+			   EVT_SUBSCRIBE_CALLBACK) and must not be closed here. */
 			return ERR_CONTINUE;
 		}
 
@@ -510,10 +631,10 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
 
 	/* Send the event to the Syslog Server */
 	/* Making sure it is severe enough to be logged */
-
+	/* Delivery failures are counted in WSockSend; they must not stop the
+	   service (a persistent send queue is planned for v5.1). */
 	if (SyslogLogLevel == 0 || (SyslogLogLevel >= (DWORD)winlevel && winlevel > 0))
-		if (SyslogSendW(tstamped_message, level))
-			status = ERR_FAIL;
+		SyslogSendW(tstamped_message, level);
 
 	/* Cleanup memory and open handles */
 	if(pwsMessage)
@@ -523,21 +644,22 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
 
 	if (hProviderMetadata)
 		EvtClose(hProviderMetadata);
-	if (hEvent)
-		EvtClose(hEvent);
+	/* Note: hEvent is owned by the Event Log service (see EVT_SUBSCRIBE_CALLBACK) */
 
 	return status;
 }
 
-/* Format Timestamp from EventLog */
-WCHAR * WinEventTimeToString(ULONGLONG ulongTime)
+/* Format Timestamp from EventLog into the caller-provided buffer */
+WCHAR * WinEventTimeToString(ULONGLONG ulongTime, WCHAR * result, size_t resultCount)
 {
 	SYSTEMTIME sysTime;
 	FILETIME fTime, lfTime;
 	ULARGE_INTEGER ulargeTime;
 	struct tm tm_struct;
-	WCHAR result[17] = L"";
-	static WCHAR formatted_result[] = L"Mmm dd hh:mm:ss";
+	WCHAR buffer[32];
+
+	if (result == NULL || resultCount < 17)
+		return NULL;
 
 	memset(&tm_struct, 0, sizeof(tm_struct));
 
@@ -568,11 +690,11 @@ WCHAR * WinEventTimeToString(ULONGLONG ulongTime)
 	tm_struct.tm_sec  = sysTime.wSecond;
 	
 	/* Format timestamp string */
-	wcsftime(result, COUNT_OF(result), L"%b %d %H:%M:%S", &tm_struct);
-	if (result[4] == L'0') /* Replace leading zero with a space for */
-		result[4] = L' ';  /* single digit days so we comply with the RFC */
+	wcsftime(buffer, COUNT_OF(buffer), L"%b %d %H:%M:%S", &tm_struct);
+	if (buffer[4] == L'0') /* Replace leading zero with a space for */
+		buffer[4] = L' ';  /* single digit days so we comply with the RFC */
 
-	wcsncpy_s(formatted_result, COUNT_OF(L"Mmm dd hh:mm:ss"), result, _TRUNCATE);
+	wcsncpy_s(result, resultCount, buffer, _TRUNCATE);
 	
-	return formatted_result;
+	return result;
 }

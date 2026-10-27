@@ -37,6 +37,8 @@
      sherwin.faria@gmail.com
 
 */
+#include <winevt.h>
+
 #define TIMEOUT		5000  // 5 seconds: Defines the timeout interval for the EvtNext call
 
 /* Windows Event Levels */
@@ -55,4 +57,12 @@
 /* Prototypes */
 DWORD   WinEventSubscribe(XPathList*,int);
 void    WinEventCancelSubscribes();
-WCHAR*  WinEventTimeToString(ULONGLONG fTime);
+WCHAR*  WinEventTimeToString(ULONGLONG fTime, WCHAR * result, size_t resultCount);
+PEVT_VARIANT WinEventRenderValues(EVT_HANDLE hEvent, LPCWSTR * values, DWORD count);
+
+/* Number of active event subscriptions (valid indices 0..subscriptions-1) */
+extern int subscriptions;
+
+/* Number of events whose message text could not be formatted
+   (reported in the periodic status message) */
+extern volatile LONG WinEventFormatFailures;

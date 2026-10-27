@@ -73,6 +73,7 @@ struct WSockSockets {
 	SOCKET Socket;			/* WinSock Socket */
 	BOOL Connected;			/* Is Socket connected and available */
 	struct sockaddr_in SockAddress; /* WinSock Address structure */
+	BOOL Configured;		/* Was this slot opened via WSockOpen */
 };
 
 static struct WSockSockets SyslogSockets[] = {
@@ -85,8 +86,12 @@ static struct WSockSockets SyslogSockets[] = {
 	{ "LogHostDhcp", INVALID_SOCKET, FALSE }
 };
 
+/* Counter of messages that could not be handed to any syslog server */
+volatile LONG WSockSendFailures = 0;
+
 // Prototypes //
 void ReconnectSocket(int id);
+static int WSockSendAll(SOCKET s, const char * buf, int len);
 
 /* Start Winsock access */
 int WSockStart()
@@ -127,7 +132,8 @@ int WSockOpen(char * loghost, unsigned short port, int ID)
 {
 	in_addr_t ip;
 	int type, protocol;
-	
+	DWORD sendTimeout = 5000; /* ms: bound blocking send() so a dead peer cannot stall event delivery */
+
 	/* Convert IP number */
 	ip = inet_addr(loghost);
 	if (ip == (in_addr_t)(-1)) {
@@ -158,7 +164,16 @@ int WSockOpen(char * loghost, unsigned short port, int ID)
 		return 1;
 	}
 
-	return ConnectSocket(loghost, port, ID);
+	setsockopt(SyslogSockets[ID].Socket, SOL_SOCKET, SO_SNDTIMEO,
+		(const char *)&sendTimeout, sizeof(sendTimeout));
+
+	/* From here on the slot is owned by the send path (reconnects) */
+	SyslogSockets[ID].Configured = TRUE;
+
+	/* A failed connect is not fatal: the socket is kept and WSockSend
+	   reconnects later, so an unreachable server cannot block startup */
+	ConnectSocket(loghost, port, ID);
+	return 0;
 }
 
 /* Connect Socket */
@@ -177,6 +192,8 @@ int ConnectSocket(char * loghost, unsigned short port, int ID)
 			loghost,
 			port,
 			WSAGetLastError());
+		SyslogSockets[ID].Connected = FALSE;
+		/* Not fatal: WSockSend will keep trying to reconnect */
 		return 1;
 	}
 
@@ -189,16 +206,42 @@ int ConnectSocket(char * loghost, unsigned short port, int ID)
 void ReconnectSocket(int id)
 {
     int result = 0;
+	int type, protocol;
+
+	/* A socket whose previous connect() failed cannot be reused reliably;
+	   rebuild it before retrying. */
+	if (SyslogSockets[id].Socket != INVALID_SOCKET) {
+		closesocket(SyslogSockets[id].Socket);
+		SyslogSockets[id].Socket = INVALID_SOCKET;
+	}
+	SyslogSockets[id].Connected = FALSE;
+
+	if (SyslogEnableTcp) {
+		type = SOCK_STREAM;
+		protocol = IPPROTO_TCP;
+	} else {
+		type = SOCK_DGRAM;
+		protocol = IPPROTO_UDP;
+	}
+
+	SyslogSockets[id].Socket = socket(SyslogSockets[id].SockAddress.sin_family, type, protocol);
+	if (SyslogSockets[id].Socket == INVALID_SOCKET) {
+		Log(LOG_ERROR|LOG_SYS, "Cannot recreate socket for %s", SyslogSockets[id].Name);
+		return;
+	}
+
+	{
+		DWORD sendTimeout = 5000;
+		setsockopt(SyslogSockets[id].Socket, SOL_SOCKET, SO_SNDTIMEO,
+			(const char *)&sendTimeout, sizeof(sendTimeout));
+	}
 
     result = connect(SyslogSockets[id].Socket,
 					 (SOCKADDR*)&SyslogSockets[id].SockAddress,
 					 sizeof(SyslogSockets[id].SockAddress));
 
 	if (result == SOCKET_ERROR) {
-		Log(LOG_ERROR|LOG_SYS,
-			"Connecting socket for %s failed with error %d",
-			SyslogSockets[id].Name,
-			WSAGetLastError());
+		/* Logged at most once per outage by the send path */
 		return;
 	}
 
@@ -224,16 +267,33 @@ void WSockClose()
 			closesocket(SyslogSockets[i].Socket);
 			SyslogSockets[i].Socket = INVALID_SOCKET;
 		}
+		SyslogSockets[i].Connected = FALSE;
 	}
 }
 
-/* Send data to syslog */
+/* Send exactly len bytes (send() may write fewer on a stream socket) */
+static int WSockSendAll(SOCKET s, const char * buf, int len)
+{
+	int sent = 0;
+
+	while (sent < len) {
+		int n = send(s, buf + sent, len - sent, 0);
+		if (n == SOCKET_ERROR || n == 0)
+			return 1;
+		sent += n;
+	}
+
+	return 0;
+}
+
+/* Send data to syslog.
+   Returns 0 when the message reached at least one server, 1 otherwise. */
 int WSockSend(char * message)
 {
 	int len;
-	int done = 0;
     int i;
     int count = COUNT_OF(SyslogSockets);
+	int delivered = 0;
 
     /* Get message length */
 	len = (int) strlen(message);
@@ -241,18 +301,42 @@ int WSockSend(char * message)
 	for (i = 0; i < count; i++)
 	{
 	    /* Send to syslog server */
-	    if(SyslogSockets[i].Socket != INVALID_SOCKET) {
-            if (SyslogSockets[i].Connected == FALSE)
-                ReconnectSocket(i);
+		if (SyslogSockets[i].Configured == FALSE)
+			continue;
 
-            if(SyslogSockets[i].Connected && send(SyslogSockets[i].Socket, message, len, 0) != len) {
-			    if (h_errno != WSAEHOSTUNREACH && h_errno != WSAENETUNREACH) {
-                    // Log the error, but continue operation if possible //
-                    Log(LOG_ERROR|LOG_SYS, "Cannot send message through socket for %s", SyslogSockets[i].Name);
-                    SyslogSockets[i].Connected = FALSE;
-			    }
-		    }
-	    }
+		if (SyslogSockets[i].Connected == FALSE)
+			ReconnectSocket(i);
+
+		if (SyslogSockets[i].Connected == FALSE)
+			continue;
+
+		if (WSockSendAll(SyslogSockets[i].Socket, message, len) != 0) {
+			int err = WSAGetLastError();
+
+			if (err != WSAEHOSTUNREACH && err != WSAENETUNREACH) {
+				// Log the error, but continue operation if possible //
+				Log(LOG_ERROR|LOG_SYS, "Cannot send message through socket for %s", SyslogSockets[i].Name);
+			}
+			SyslogSockets[i].Connected = FALSE;
+			continue;
+		}
+
+		/* TCP is a byte stream: frame the message with a trailing newline
+		   (RFC 6587 non-transparent framing) */
+		if (SyslogEnableTcp) {
+			if (WSockSendAll(SyslogSockets[i].Socket, "\n", 1) != 0) {
+				SyslogSockets[i].Connected = FALSE;
+				continue;
+			}
+		}
+
+		delivered++;
+	}
+
+	/* Report failures accurately: nothing reached any server */
+	if (delivered == 0) {
+		InterlockedIncrement(&WSockSendFailures);
+		return 1;
 	}
 
 	/* Success */

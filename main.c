@@ -59,6 +59,7 @@
 #include "dns.h"
 #include "eventlog.h"
 #include "log.h"
+#include "service.h"
 #include "syslog.h"
 #include "getopt.h"
 #include "ver.h"
@@ -352,20 +353,25 @@ int main(int argc, char ** argv)
 // Shut down the console cleanly //
 BOOL WINAPI ShutdownConsole(DWORD dwCtrlType)
 {
-    Log(LOG_INFO, "Signal caught, shutting down and exiting...");
     switch(dwCtrlType)
     {
         case CTRL_C_EVENT:
         case CTRL_BREAK_EVENT:
         case CTRL_CLOSE_EVENT:
+            Log(LOG_INFO, "Signal caught, shutting down and exiting...");
+            if (ServiceStopEvent != NULL) {
+                /* Let MainLoop run its own cleanup and exit normally so that
+                   subscription handles are destroyed by a single thread */
+                ServiceSignalStop();
+                return TRUE;
+            }
+            /* Nothing is monitoring (install/uninstall): clean up and exit */
             if (CheckForWindowsEvents())
                 WinEventCancelSubscribes();
             EventlogsClose();
             SyslogClose();
-            break;
+            exit(0);
         default:
             return FALSE;
     }
-
-    exit(0);
 }

@@ -43,6 +43,17 @@
 /* Effect main loop */
 BOOL ServiceIsRunning = TRUE;
 
+/* Signalled to request shutdown; created by MainLoop */
+HANDLE ServiceStopEvent = NULL;
+
+/* Request shutdown without blocking the calling thread */
+void ServiceSignalStop(void)
+{
+	ServiceIsRunning = FALSE;
+	if (ServiceStopEvent != NULL)
+		SetEvent(ServiceStopEvent);
+}
+
 /* Forward */
 static void WINAPI ServiceMain(DWORD argc, LPTSTR * argv);
 
@@ -73,8 +84,29 @@ int ServiceInstall()
 	new_service = CreateService(service_manager, "EvtSys", "Eventlog to Syslog", SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_IGNORE, ProgramExePath, NULL, NULL, "eventlog\0", NULL, NULL);
 	if (new_service == NULL)
 		Log(LOG_ERROR|LOG_SYS, "Cannot create service");
-	else
+	else {
+		/* Restart automatically if the service dies unexpectedly */
+		SERVICE_FAILURE_ACTIONS failure_actions;
+		SC_ACTION actions[3];
+
+		actions[0].Type = SC_ACTION_RESTART;
+		actions[0].Delay = 5000;
+		actions[1].Type = SC_ACTION_RESTART;
+		actions[1].Delay = 15000;
+		actions[2].Type = SC_ACTION_NONE;
+		actions[2].Delay = 0;
+
+		failure_actions.dwResetPeriod = 86400;
+		failure_actions.lpRebootMsg = NULL;
+		failure_actions.lpCommand = NULL;
+		failure_actions.cActions = COUNT_OF(actions);
+		failure_actions.lpsaActions = actions;
+
+		if (!ChangeServiceConfig2(new_service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure_actions))
+			Log(LOG_WARNING|LOG_SYS, "Cannot set service failure actions");
+
 		CloseServiceHandle(new_service);
+	}
 
 	/* Close the connection to the manager */
 	CloseServiceHandle(service_manager);
@@ -134,12 +166,16 @@ static void WINAPI ServiceChange(DWORD code)
 	(we may want to implement "pause" and "continue" later on) */
 	if (code == SERVICE_CONTROL_STOP) {
 
-		/* Terminate loop */
-		ServiceIsRunning = FALSE;
+		/* Tell the SCM we are shutting down before doing any work */
+		ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
+		ServiceStatus.dwCheckPoint = 1;
+		ServiceStatus.dwWaitHint = 15000;
+		SetServiceStatus(ServiceStatusHandle, &ServiceStatus);
 
-		/* Wait until service stops */
-		while (ServiceStatus.dwCurrentState != SERVICE_STOPPED)
-			Sleep(500);
+		/* Terminate the main loop and return immediately: cleanup and the
+		   SERVICE_STOPPED report happen in ServiceMain after MainLoop
+		   returns, so the control handler never blocks the SCM. */
+		ServiceSignalStop();
 	}
 }
 
@@ -171,6 +207,8 @@ static void WINAPI ServiceMain(DWORD argc, LPTSTR * argv)
 
 	/* Send stop message */
 	ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+	ServiceStatus.dwCheckPoint = 0;
+	ServiceStatus.dwWaitHint = 0;
 
 	/* Report status */
 	if (SetServiceStatus(ServiceStatusHandle, &ServiceStatus) == FALSE) {

@@ -37,3 +37,9 @@
 /* Effect main loop */
 extern BOOL ServiceIsRunning;
 
+/* Manual-reset event that wakes the main loop for shutdown */
+extern HANDLE ServiceStopEvent;
+
+/* Signal the main loop to stop (safe from any thread) */
+void ServiceSignalStop(void);
+

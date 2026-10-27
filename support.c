@@ -85,7 +85,7 @@ int EndsWith(const LPWSTR str, const LPWSTR suffix)
 		return 0;
 	lenstr = wcslen(str);
 
-	lensuffix = strlen(suffix);
+	lensuffix = wcslen(suffix);
 	if (lensuffix >  lenstr)
 		return 0;
 
@@ -101,7 +101,7 @@ int StartsWith(const LPWSTR str, const LPWSTR suffix)
 		return 0;
 	lenstr = wcslen(str);
 
-	lensuffix = strlen(suffix);
+	lensuffix = wcslen(suffix);
 	if (lensuffix >  lenstr)
 		return 0;
 
@@ -509,8 +509,10 @@ char * CollapseExpandMessage(char * message)
 }
 
 
-/* WIDE Collapse white space and expand error numbers */
-WCHAR * CollapseExpandMessageW(WCHAR * message)
+/* WIDE Collapse white space and expand error numbers.
+   Writes into the caller-provided buffer so concurrent callers cannot
+   overwrite each other's results. Returns result, or NULL on bad args. */
+WCHAR * CollapseExpandMessageW(WCHAR * message, WCHAR * result, size_t resultCount)
 {
 	BOOL skip_space = FALSE;
 	DWORD errnum;
@@ -520,7 +522,8 @@ WCHAR * CollapseExpandMessageW(WCHAR * message)
 	WCHAR ch;
 	WCHAR errstr[ERRMSG_SZ];
 
-	static WCHAR result[SYSLOG_DEF_SZ];
+	if (message == NULL || result == NULL || resultCount == 0)
+		return NULL;
 
 	/* Initialize */
 	ip = message;
@@ -528,7 +531,7 @@ WCHAR * CollapseExpandMessageW(WCHAR * message)
 	np = NULL;
 
 	/* Loop until buffer is full */
-	while (op - result < COUNT_OF(result)-1) {
+	while ((size_t)(op - result) < resultCount-1) {
 
 		/* Are we at end of input */
 		ch = *ip;
